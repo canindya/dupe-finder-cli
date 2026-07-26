@@ -76,6 +76,11 @@ python dupe_finder.py --type pdf --dry-run
 
 # Prefer keeping copies on a specific drive/folder; fall back to --keep otherwise
 python dupe_finder.py --type pdf --recycle --prefer L: --keep oldest
+
+# Repeat runs reuse cached hashes (unchanged files aren't re-hashed)
+python dupe_finder.py --type pdf              # first run populates the cache
+python dupe_finder.py --type pdf              # second run is much faster
+python dupe_finder.py --type pdf --no-cache   # force a full re-hash
 ```
 
 ## Deletion safety
@@ -116,6 +121,8 @@ python dupe_finder.py --type pdf --recycle --prefer L: --keep oldest
 | `--yes` | Skip the final confirmation prompt. |
 | `--log FILE` | Write a JSON log of deleted files. |
 | `--workers N` | Parallel hashing threads (default: based on CPU count). Use `1` for spinning disks where parallel reads thrash. |
+| `--cache FILE` | Persistent hash-cache file (default: per-user cache dir). Unchanged files aren't re-hashed on repeat runs. |
+| `--no-cache` | Disable the persistent hash cache for this run. |
 | `-q, --quiet` | Suppress progress output. |
 
 ## Notes
@@ -135,9 +142,15 @@ python dupe_finder.py --type pdf --recycle --prefer L: --keep oldest
 - Hashing is multi-threaded by default. On **SSDs/NVMe** this is a big speedup;
   on a single **spinning HDD**, parallel reads can thrash the head — pass
   `--workers 1` there.
-- `--recycle` uses the [`send2trash`](https://pypi.org/project/send2trash/)
-  package if it's installed (best cross-platform behavior); otherwise on Windows
-  it falls back to the native shell API via `ctypes` — no install required.
+- `--recycle` works **natively on every platform, no dependency required**:
+  the Windows shell API via `ctypes`, `~/.Trash` on macOS, and the FreeDesktop
+  trash spec on Linux (home trash, or the mount's `.Trash-$uid` for other
+  drives, with restorable `.trashinfo` metadata). If the
+  [`send2trash`](https://pypi.org/project/send2trash/) package happens to be
+  installed it's used in preference (most battle-tested), but it's optional.
+- Repeat scans are fast: full-content hashes are cached per user, keyed by
+  path + size + mtime, so unchanged files are never re-hashed. Control it with
+  `--cache FILE` / `--no-cache`.
 - Output is written with `errors="replace"`, so filenames containing characters
   the console can't display won't crash the run (they show a `?` placeholder).
 - Requires Python 3.9+.

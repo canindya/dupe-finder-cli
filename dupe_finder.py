@@ -34,6 +34,7 @@ import json
 import os
 import string
 import sys
+import threading
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -45,6 +46,86 @@ CHUNK = 1024 * 1024        # streaming chunk size for full hashing
 def default_workers() -> int:
     """A sensible thread count for hashing (I/O + hashlib both release the GIL)."""
     return min(16, (os.cpu_count() or 2) * 2)
+
+
+def default_cache_path() -> str:
+    """Per-user location for the persistent full-hash cache."""
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    else:
+        base = os.environ.get("XDG_CACHE_HOME") or os.path.join(
+            os.path.expanduser("~"), ".cache")
+    return os.path.join(base, "dupe_finder", "hashes.json")
+
+
+class HashCache:
+    """Persistent cache of full-content hashes keyed by (path, size, mtime).
+
+    Only full hashes are cached (they dominate cost); partial hashes are cheap
+    enough to always recompute. An entry is trusted only while a file's size and
+    modification time are unchanged, so edited files are automatically re-hashed.
+    Thread-safe for concurrent use during parallel hashing."""
+
+    def __init__(self, path: str | None, enabled: bool = True):
+        self.path = path
+        self.enabled = enabled and path is not None
+        self.data: dict[str, str] = {}
+        self.hits = 0
+        self.misses = 0
+        self._dirty = False
+        self._lock = threading.Lock()
+        if self.enabled:
+            self._load()
+
+    def _load(self) -> None:
+        try:
+            with open(self.path, encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                self.data = loaded
+        except (OSError, ValueError):
+            self.data = {}  # missing or corrupt cache: start fresh
+
+    @staticmethod
+    def _key(path: str) -> str | None:
+        try:
+            st = os.stat(path)
+        except OSError:
+            return None
+        return f"{os.path.abspath(path)}|{st.st_size}|{st.st_mtime_ns}"
+
+    def get_or_compute(self, path: str) -> str | None:
+        """Return the file's full hash, from cache if the entry is still valid,
+        otherwise compute and remember it."""
+        if not self.enabled:
+            return hash_file(path)
+        key = self._key(path)
+        if key is None:
+            return None
+        cached = self.data.get(key)
+        if cached is not None:
+            with self._lock:
+                self.hits += 1
+            return cached
+        h = hash_file(path)
+        with self._lock:
+            self.misses += 1
+            if h is not None:
+                self.data[key] = h
+                self._dirty = True
+        return h
+
+    def save(self) -> None:
+        if not (self.enabled and self._dirty):
+            return
+        try:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            tmp = f"{self.path}.tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.data, f)
+            os.replace(tmp, self.path)  # atomic
+        except OSError as e:
+            print(f"! Could not write hash cache: {e}", file=sys.stderr)
 
 
 # --------------------------------------------------------------------------- #
@@ -187,12 +268,119 @@ def _recycle_via_ctypes(path: str) -> None:
         raise OSError(f"SHFileOperation failed (code {res}) for {path}")
 
 
-def send_to_recycle(path: str) -> None:
-    """Move *path* to the Recycle Bin / Trash.
+def _unique_trash_name(files_dir: str, info_dir: str, name: str) -> str:
+    """A base name free in BOTH <files_dir>/<name> and <info_dir>/<name>.trashinfo."""
+    stem, ext = os.path.splitext(name)
+    candidate = name
+    i = 1
+    while (os.path.lexists(os.path.join(files_dir, candidate))
+           or os.path.lexists(os.path.join(info_dir, candidate + ".trashinfo"))):
+        candidate = f"{stem}.{i}{ext}"
+        i += 1
+    return candidate
 
-    Prefers the ``send2trash`` package if installed (best cross-platform
-    behavior); otherwise falls back to the native Windows shell API. Raises
-    OSError / RuntimeError if the file cannot be recycled."""
+
+def _unique_dest(directory: str, name: str) -> str:
+    """Return a filename in *directory* not already taken (bare name)."""
+    stem, ext = os.path.splitext(name)
+    candidate = name
+    i = 1
+    while os.path.lexists(os.path.join(directory, candidate)):
+        candidate = f"{stem}.{i}{ext}"
+        i += 1
+    return candidate
+
+
+def _trash_into(path: str, trash_dir: str) -> None:
+    """FreeDesktop-style: move *path* into <trash_dir>/files and record a
+    .trashinfo in <trash_dir>/info so it's restorable. Cross-platform-safe core
+    (no OS-only calls) so it can be unit-tested anywhere."""
+    import datetime
+    import shutil
+    import urllib.parse
+
+    src = os.path.abspath(path)
+    files_dir = os.path.join(trash_dir, "files")
+    info_dir = os.path.join(trash_dir, "info")
+    os.makedirs(files_dir, exist_ok=True)
+    os.makedirs(info_dir, exist_ok=True)
+
+    dest_name = _unique_trash_name(files_dir, info_dir, os.path.basename(src))
+
+    when = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    info_path = os.path.join(info_dir, dest_name + ".trashinfo")
+    with open(info_path, "w", encoding="utf-8") as f:
+        f.write("[Trash Info]\n"
+                f"Path={urllib.parse.quote(src)}\n"
+                f"DeletionDate={when}\n")
+
+    dest = os.path.join(files_dir, dest_name)
+    try:
+        os.rename(src, dest)               # fast path (same filesystem)
+    except OSError:
+        try:
+            shutil.move(src, dest)          # cross-device
+        except Exception:
+            os.remove(info_path)            # don't leave orphan metadata
+            raise
+
+
+def _mount_point(path: str) -> str:
+    path = os.path.abspath(path)
+    while not os.path.ismount(path):
+        parent = os.path.dirname(path)
+        if parent == path:
+            break
+        path = parent
+    return path
+
+
+def _trash_freedesktop(path: str) -> None:
+    """Linux/BSD Trash per the FreeDesktop spec: home trash when on the same
+    filesystem, else the top-directory trash (<mount>/.Trash-$uid)."""
+    src = os.path.abspath(path)
+    xdg = os.environ.get("XDG_DATA_HOME") or os.path.join(
+        os.path.expanduser("~"), ".local", "share")
+    home_trash = os.path.join(xdg, "Trash")
+
+    same_fs = False
+    try:
+        anchor = xdg if os.path.exists(xdg) else os.path.expanduser("~")
+        same_fs = os.stat(src).st_dev == os.stat(anchor).st_dev
+    except OSError:
+        same_fs = True  # best effort: use home trash
+
+    if same_fs:
+        _trash_into(src, home_trash)
+        return
+    # File lives on another mount — trash on that mount so the move is a rename.
+    mount = _mount_point(src)
+    uid = os.getuid()  # POSIX-only; this branch only runs on POSIX
+    _trash_into(src, os.path.join(mount, f".Trash-{uid}"))
+
+
+def _trash_macos(path: str) -> None:
+    """macOS: move into the user's Trash (~/.Trash). Recoverable via Finder."""
+    import shutil
+    src = os.path.abspath(path)
+    trash = os.path.join(os.path.expanduser("~"), ".Trash")
+    os.makedirs(trash, exist_ok=True)
+    dest_name = _unique_dest(trash, os.path.basename(src))
+    dest = os.path.join(trash, dest_name)
+    try:
+        os.rename(src, dest)
+    except OSError:
+        shutil.move(src, dest)  # file on another volume
+
+
+def send_to_recycle(path: str) -> None:
+    """Move *path* to the Recycle Bin / Trash — natively on every platform.
+
+    Order of preference: the ``send2trash`` package if it happens to be
+    installed (most battle-tested), then the OS-native implementation
+    (Windows shell API, macOS ~/.Trash, FreeDesktop trash on Linux). No
+    third-party dependency is required on any platform. Raises OSError on
+    failure."""
     try:
         from send2trash import send2trash  # type: ignore
         send2trash(os.path.abspath(path))
@@ -201,11 +389,10 @@ def send_to_recycle(path: str) -> None:
         pass
     if os.name == "nt":
         _recycle_via_ctypes(path)
-        return
-    raise RuntimeError(
-        "Recycle Bin support on this platform requires the 'send2trash' "
-        "package. Install it with: pip install send2trash"
-    )
+    elif sys.platform == "darwin":
+        _trash_macos(path)
+    else:
+        _trash_freedesktop(path)
 
 
 # --------------------------------------------------------------------------- #
@@ -276,13 +463,13 @@ class Scanner:
         return {s: paths for s, paths in by_size.items() if len(paths) > 1}
 
 
-def _hash_many(paths: list[str], limit: int | None, workers: int,
+def _hash_many(paths: list[str], hash_fn, workers: int,
                label: str, verbose: bool) -> dict[str, str]:
-    """Hash *paths* (optionally only the first *limit* bytes) concurrently.
+    """Apply *hash_fn(path) -> str|None* to every path concurrently.
 
-    Returns {path: hash}, silently dropping unreadable files. Falls back to a
-    plain sequential loop when workers <= 1 (useful for spinning disks, where
-    parallel reads can thrash the head)."""
+    Returns {path: hash}, silently dropping paths that hash to None (unreadable
+    files). Falls back to a plain sequential loop when workers <= 1 (useful for
+    spinning disks, where parallel reads can thrash the head)."""
     result: dict[str, str] = {}
     done = 0
     total = len(paths)
@@ -295,14 +482,14 @@ def _hash_many(paths: list[str], limit: int | None, workers: int,
 
     if workers <= 1:
         for p in paths:
-            h = hash_file(p, limit=limit)
+            h = hash_fn(p)
             if h is not None:
                 result[p] = h
             _tick()
         return result
 
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        futures = {ex.submit(hash_file, p, limit): p for p in paths}
+        futures = {ex.submit(hash_fn, p): p for p in paths}
         for fut in as_completed(futures):
             h = fut.result()
             if h is not None:
@@ -312,32 +499,38 @@ def _hash_many(paths: list[str], limit: int | None, workers: int,
 
 
 def find_duplicates(by_size: dict[int, list[str]], workers: int = 1,
+                    cache: "HashCache | None" = None,
                     verbose: bool = False) -> list[list[str]]:
     """Refine size groups into confirmed duplicate groups.
 
     Two content passes, each hashing in parallel: a cheap partial hash (first
     64 KB) to weed out obvious non-matches, then a full-content hash to confirm.
     Hashes are only ever compared within the same size, so distinct files that
-    happen to share a partial hash are never falsely merged."""
+    happen to share a partial hash are never falsely merged. The full pass reads
+    from *cache* (keyed by path+size+mtime) when provided, so unchanged files
+    are not re-hashed on repeat runs."""
     size_of = {p: size for size, paths in by_size.items() for p in paths}
     candidates = list(size_of)
 
-    # Pass 1: partial hash everything, bucket by (size, partial-hash).
+    # Pass 1: partial hash everything (always fresh — cheap), bucket by
+    # (size, partial-hash).
     if verbose:
         print(f"  hashing {len(candidates):,} candidates (partial pass, "
               f"{workers} worker(s))", file=sys.stderr)
-    partial = _hash_many(candidates, PARTIAL_READ, workers, "partial-hashed", verbose)
+    partial = _hash_many(candidates, lambda p: hash_file(p, PARTIAL_READ),
+                         workers, "partial-hashed", verbose)
     partial_buckets: dict[tuple[int, str], list[str]] = defaultdict(list)
     for p, ph in partial.items():
         partial_buckets[(size_of[p], ph)].append(p)
 
     survivors = [p for grp in partial_buckets.values() if len(grp) > 1 for p in grp]
 
-    # Pass 2: full hash only survivors, bucket by (size, full-hash).
+    # Pass 2: full hash only survivors (cache-backed), bucket by (size, full-hash).
     if verbose:
         print(f"  confirming {len(survivors):,} candidates (full pass)",
               file=sys.stderr)
-    full = _hash_many(survivors, None, workers, "full-hashed", verbose)
+    full_fn = cache.get_or_compute if cache is not None else (lambda p: hash_file(p))
+    full = _hash_many(survivors, full_fn, workers, "full-hashed", verbose)
     full_buckets: dict[tuple[int, str], list[str]] = defaultdict(list)
     for p, fh in full.items():
         full_buckets[(size_of[p], fh)].append(p)
@@ -600,6 +793,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--workers", type=int, default=default_workers(), metavar="N",
                    help=f"Parallel hashing threads (default: {default_workers()}). "
                         "Use 1 for spinning disks where parallel reads thrash.")
+    p.add_argument("--cache", default=None, metavar="FILE",
+                   help=f"Persistent hash cache file (default: {default_cache_path()}). "
+                        "Unchanged files are not re-hashed on repeat runs.")
+    p.add_argument("--no-cache", action="store_true",
+                   help="Disable the persistent hash cache for this run.")
     p.add_argument("-q", "--quiet", action="store_true",
                    help="Suppress progress output.")
     return p
@@ -659,7 +857,14 @@ def main(argv: list[str] | None = None) -> int:
     if verbose:
         print(f"Size groups with potential dupes: {len(by_size):,}", file=sys.stderr)
 
-    groups = find_duplicates(by_size, workers=max(1, args.workers), verbose=verbose)
+    cache = HashCache(args.cache or default_cache_path(), enabled=not args.no_cache)
+    groups = find_duplicates(by_size, workers=max(1, args.workers),
+                             cache=cache, verbose=verbose)
+    cache.save()
+    if verbose and cache.enabled and (cache.hits or cache.misses):
+        print(f"Hash cache: {cache.hits:,} hit(s), {cache.misses:,} miss(es)",
+              file=sys.stderr)
+
     total_waste = report(groups)
 
     do_delete = args.delete or args.recycle or args.dry_run
