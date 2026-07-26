@@ -169,6 +169,64 @@ def normalize_extensions(values: list[str] | None) -> set[str]:
     return exts
 
 
+# Friendly file-type categories, so users can say "movies" instead of listing
+# a dozen extensions. Keys are the canonical names; CATEGORY_ALIASES map common
+# synonyms onto them.
+CATEGORIES: dict[str, list[str]] = {
+    "movies": [".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v",
+               ".mpg", ".mpeg", ".3gp", ".ts", ".m2ts", ".vob", ".ogv", ".rm",
+               ".rmvb", ".divx", ".asf", ".mts"],
+    "music": [".mp3", ".flac", ".wav", ".aac", ".ogg", ".m4a", ".wma", ".aiff",
+              ".aif", ".alac", ".opus", ".ape", ".mid", ".midi", ".amr"],
+    "photos": [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif", ".heic",
+               ".heif", ".webp", ".svg", ".ico", ".raw", ".cr2", ".cr3", ".nef",
+               ".arw", ".dng", ".orf", ".rw2", ".raf", ".psd"],
+    "documents": [".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+                  ".odt", ".ods", ".odp", ".rtf", ".txt", ".md", ".csv", ".tsv",
+                  ".pages", ".key", ".numbers"],
+    "ebooks": [".epub", ".mobi", ".azw", ".azw3", ".pdf", ".djvu", ".fb2",
+               ".cbz", ".cbr", ".lit"],
+    "archives": [".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz", ".tgz",
+                 ".tbz2", ".iso", ".cab", ".arj", ".lz", ".lzma", ".z", ".zst"],
+    "code": [".py", ".js", ".ts", ".jsx", ".tsx", ".java", ".c", ".cpp", ".cc",
+             ".h", ".hpp", ".cs", ".go", ".rs", ".rb", ".php", ".swift", ".kt",
+             ".scala", ".sh", ".html", ".css", ".json", ".xml", ".yaml", ".yml",
+             ".sql", ".r", ".m", ".pl"],
+}
+
+CATEGORY_ALIASES: dict[str, str] = {
+    "movie": "movies", "video": "movies", "videos": "movies", "film": "movies",
+    "films": "movies",
+    "audio": "music", "song": "music", "songs": "music", "sound": "music",
+    "sounds": "music",
+    "photo": "photos", "image": "photos", "images": "photos", "picture": "photos",
+    "pictures": "photos", "pics": "photos", "pic": "photos",
+    "document": "documents", "docs": "documents", "doc": "documents",
+    "office": "documents",
+    "ebook": "ebooks", "book": "ebooks", "books": "ebooks",
+    "archive": "archives", "compressed": "archives", "zips": "archives",
+    "source": "code", "sourcecode": "code", "src": "code",
+}
+
+
+def expand_categories(values: list[str] | None) -> set[str]:
+    """Turn category names (with aliases, comma-separated or repeated) into a set
+    of '.ext' strings. Unknown names print a warning listing valid categories."""
+    exts: set[str] = set()
+    for value in values or []:
+        for token in value.replace(" ", ",").split(","):
+            name = token.strip().lower()
+            if not name:
+                continue
+            name = CATEGORY_ALIASES.get(name, name)
+            if name in CATEGORIES:
+                exts.update(CATEGORIES[name])
+            else:
+                print(f"! Unknown category '{token.strip()}'. Valid: "
+                      f"{', '.join(sorted(CATEGORIES))}", file=sys.stderr)
+    return exts
+
+
 def windows_drives() -> list[str]:
     """Return the root of every accessible drive on Windows."""
     drives = []
@@ -766,6 +824,12 @@ def build_parser() -> argparse.ArgumentParser:
                    dest="types", metavar="EXT",
                    help="Only scan these file extensions, e.g. --type jpg,png "
                         "(repeatable; leading dot optional). Default: all files.")
+    p.add_argument("-c", "--category", "--kind", action="append", default=[],
+                   dest="categories", metavar="NAME",
+                   help="Only scan a file-type category: "
+                        f"{', '.join(sorted(CATEGORIES))} (with synonyms like "
+                        "'video', 'audio', 'images'). Repeatable/comma-separated; "
+                        "combines with --type.")
     p.add_argument("--exclude", action="append", default=[], metavar="SUBSTR",
                    help="Skip paths containing this substring (repeatable).")
     p.add_argument("--follow-symlinks", action="store_true",
@@ -831,10 +895,12 @@ def main(argv: list[str] | None = None) -> int:
     excludes = default_subs + args.exclude
     exclude_prefixes = default_prefixes
 
-    extensions = normalize_extensions(args.types)
+    extensions = normalize_extensions(args.types) | expand_categories(args.categories)
 
     verbose = not args.quiet
     print(f"Scanning: {', '.join(roots)}")
+    if args.categories:
+        print(f"Categories: {', '.join(args.categories)}")
     if extensions:
         print(f"File types: {', '.join(sorted(extensions))}")
     if excludes:

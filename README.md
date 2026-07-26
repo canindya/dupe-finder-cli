@@ -59,6 +59,11 @@ python dupe_finder.py --min-size 1MB
 python dupe_finder.py --type jpg,png,gif
 python dupe_finder.py -p D:\Music --ext .mp3 --ext .flac
 
+# Or use a friendly category instead of listing extensions
+python dupe_finder.py --category movies          # find duplicate videos
+python dupe_finder.py --kind music               # 'music' == 'audio' == 'songs'
+python dupe_finder.py --category photos,documents
+
 # Report, then delete redundant copies keeping the OLDEST one, prompt to confirm
 python dupe_finder.py --delete --keep oldest
 
@@ -108,6 +113,7 @@ python dupe_finder.py --type pdf --no-cache   # force a full re-hash
 |---|---|
 | `-p, --path DIR` | Directory to scan (repeatable). Default: all drives. |
 | `-t, --type, --ext EXT` | Only scan these extensions, e.g. `jpg,png` (repeatable, leading dot optional, case-insensitive). Default: all files. |
+| `-c, --category, --kind NAME` | Only scan a file-type category: `movies`, `music`, `photos`, `documents`, `ebooks`, `archives`, `code` (plus synonyms like `video`, `audio`, `images`). Repeatable/comma-separated; combines with `--type`. |
 | `--min-size SIZE` | Ignore files smaller than this (e.g. `1MB`). Default `1`. |
 | `--max-size SIZE` | Ignore files larger than this. |
 | `--exclude SUBSTR` | Skip any path containing this substring (repeatable). |
@@ -151,6 +157,11 @@ python dupe_finder.py --type pdf --no-cache   # force a full re-hash
 - Repeat scans are fast: full-content hashes are cached per user, keyed by
   path + size + mtime, so unchanged files are never re-hashed. Control it with
   `--cache FILE` / `--no-cache`.
+- Categories filter *which files are scanned*; the tool still only ever removes
+  **duplicates** (keeping one copy per group). `--category music` finds duplicate
+  music files across your drives — it does not delete your whole music library.
+  Because matching is by content, it also catches the same song saved under
+  different names or extensions (e.g. a `.mp3` and `.m4a` with identical bytes).
 - Output is written with `errors="replace"`, so filenames containing characters
   the console can't display won't crash the run (they show a `?` placeholder).
 - Requires Python 3.9+.
