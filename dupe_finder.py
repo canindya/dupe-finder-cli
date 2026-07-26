@@ -104,6 +104,39 @@ def default_roots() -> list[str]:
     return ["/"]
 
 
+def default_exclusions() -> tuple[list[str], list[str]]:
+    """System locations to skip when scanning whole drives / the filesystem root.
+
+    Returns ``(substrings, prefixes)``:
+      * substrings match anywhere in a path (used on Windows, where the system
+        drive letter varies),
+      * prefixes match a path only at the filesystem root (anchored), so a user
+        folder like ``/home/me/dev`` is never mistaken for ``/dev``.
+    Only meaningful for a whole-root scan; skipped when explicit paths are given.
+    """
+    if os.name == "nt":
+        return ([
+            "\\Windows\\", "\\$Recycle.Bin", "\\System Volume Information",
+            "\\ProgramData\\", "\\AppData\\",
+        ], [])
+
+    if sys.platform == "darwin":
+        prefixes = [
+            "/System", "/Library", "/private", "/Volumes", "/Applications",
+            "/usr", "/bin", "/sbin", "/opt", "/cores", "/dev", "/.Spotlight-V100",
+            "/.Trashes", "/.fseventsd",
+        ]
+        prefixes.append(os.path.join(os.path.expanduser("~"), "Library"))
+        return ([], prefixes)
+
+    # Linux / other POSIX — pseudo-filesystems first, then common system trees.
+    return ([], [
+        "/proc", "/sys", "/dev", "/run", "/boot", "/lost+found",
+        "/usr", "/bin", "/sbin", "/lib", "/lib64", "/opt", "/snap",
+        "/var", "/tmp",
+    ])
+
+
 def hash_file(path: str, limit: int | None = None) -> str | None:
     """Hash a file's content (blake2b). If *limit*, hash only the first N bytes.
     Returns None on read errors (permission, locked, vanished)."""
@@ -184,13 +217,20 @@ class Scanner:
     min_size: int = 1
     max_size: int | None = None
     follow_symlinks: bool = False
-    exclude: list[str] = field(default_factory=list)
+    exclude: list[str] = field(default_factory=list)          # substring match
+    exclude_prefixes: list[str] = field(default_factory=list)  # anchored at root
     extensions: set[str] = field(default_factory=set)  # e.g. {".jpg", ".png"}
     verbose: bool = False
 
     def _excluded(self, path: str) -> bool:
         low = path.lower()
-        return any(x.lower() in low for x in self.exclude)
+        if any(x.lower() in low for x in self.exclude):
+            return True
+        for pre in self.exclude_prefixes:
+            p = pre.lower().rstrip("/\\")
+            if low == p or low.startswith(p + "/") or low.startswith(p + "\\"):
+                return True
+        return False
 
     def _wanted_type(self, name: str) -> bool:
         if not self.extensions:
@@ -585,14 +625,13 @@ def main(argv: list[str] | None = None) -> int:
         print("No valid paths to scan.", file=sys.stderr)
         return 2
 
-    # Sensible default exclusions on Windows to avoid churning system files.
-    default_excludes = []
-    if os.name == "nt" and not args.paths:
-        default_excludes = [
-            "\\Windows\\", "\\$Recycle.Bin", "\\System Volume Information",
-            "\\ProgramData\\", "\\AppData\\",
-        ]
-    excludes = default_excludes + args.exclude
+    # Skip system locations when scanning whole drives / the filesystem root,
+    # unless the user chose explicit paths. Platform-aware (see default_exclusions).
+    default_subs, default_prefixes = ([], [])
+    if not args.paths:
+        default_subs, default_prefixes = default_exclusions()
+    excludes = default_subs + args.exclude
+    exclude_prefixes = default_prefixes
 
     extensions = normalize_extensions(args.types)
 
@@ -602,6 +641,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"File types: {', '.join(sorted(extensions))}")
     if excludes:
         print(f"Excluding paths containing: {', '.join(excludes)}")
+    if exclude_prefixes:
+        print(f"Excluding system locations: {', '.join(exclude_prefixes)}")
 
     scanner = Scanner(
         roots=roots,
@@ -609,6 +650,7 @@ def main(argv: list[str] | None = None) -> int:
         max_size=parse_size(args.max_size) if args.max_size else None,
         follow_symlinks=args.follow_symlinks,
         exclude=excludes,
+        exclude_prefixes=exclude_prefixes,
         extensions=extensions,
         verbose=verbose,
     )

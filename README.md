@@ -120,9 +120,16 @@ python dupe_finder.py --type pdf --recycle --prefer L: --keep oldest
 
 ## Notes
 
-- On Windows, when scanning all drives (no `-p`), system locations are skipped by
-  default: `\Windows\`, `\$Recycle.Bin`, `\System Volume Information`,
-  `\ProgramData\`, and `\AppData\`. Pass explicit `-p` paths to scan those.
+- When scanning whole drives / the filesystem root (no `-p`), system locations
+  are skipped by default, tailored per OS. Pass explicit `-p` paths to scan them.
+  - **Windows:** `\Windows\`, `\$Recycle.Bin`, `\System Volume Information`,
+    `\ProgramData\`, `\AppData\`.
+  - **macOS:** `/System`, `/Library`, `/private`, `/Volumes`, `/Applications`,
+    `/usr`, `~/Library`, and friends.
+  - **Linux:** pseudo-filesystems (`/proc`, `/sys`, `/dev`, `/run`) plus common
+    system trees (`/usr`, `/var`, `/boot`, `/snap`, `/tmp`, …).
+  - Unix defaults are **anchored at the root**, so a user folder like
+    `~/dev` or `~/var` is never mistaken for `/dev` or `/var`.
 - Scanning entire drives can take a while and touch many files; start with a
   single folder or a `--min-size` filter to get a feel for it.
 - Hashing is multi-threaded by default. On **SSDs/NVMe** this is a big speedup;

@@ -33,7 +33,13 @@ stay fast:
 
 1. `Scanner.collect_by_size()` — walk roots, bucket files by exact size; discard
    unique sizes (a unique size cannot have a duplicate). Applies `--type`,
-   `--exclude`, size filters, symlink policy here.
+   `--exclude`, size filters, symlink policy here. `Scanner` has two exclusion
+   fields: `exclude` (substring match, from `--exclude` and Windows defaults) and
+   `exclude_prefixes` (anchored root match). `default_exclusions()` returns the
+   per-OS `(substrings, prefixes)` skip-list applied only on a whole-root scan
+   (no `-p`). Unix system dirs MUST use prefixes, not substrings — a substring
+   `/dev/` would wrongly exclude `~/dev`; `_excluded()` matches prefixes with
+   `startswith(prefix + sep)` so only root-level `/dev` is skipped.
 2. `find_duplicates()` — a **partial hash** pass (first 64 KB, `PARTIAL_READ`)
    buckets candidates by `(size, partial_hash)`, then a **full-content hash**
    pass confirms survivors, bucketing by `(size, full_hash)`. Hashes are only
