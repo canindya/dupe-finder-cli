@@ -135,6 +135,28 @@ python dupe_finder.py --type pdf --recycle --prefer L: --keep oldest
   the console can't display won't crash the run (they show a `?` placeholder).
 - Requires Python 3.9+.
 
+## Releasing (maintainers)
+
+Releases are published to PyPI automatically by
+`.github/workflows/release.yml` using **PyPI Trusted Publishing** (OIDC) — no
+API tokens are stored. One-time setup:
+
+1. On PyPI, add a *trusted publisher* for the project `dupe-finder-cli`:
+   owner `canindya`, repo `dupe-finder-cli`, workflow `release.yml`,
+   environment `pypi`. (Do the same on TestPyPI with environment `testpypi` if
+   you want to dry-run.)
+2. In the GitHub repo settings, create environments named `pypi` (and
+   optionally `testpypi`).
+
+Then, to cut a release:
+
+1. Bump `version` in `pyproject.toml` and commit.
+2. Publish a GitHub Release (tag e.g. `v1.0.1`) — the workflow builds the sdist
+   and wheel and publishes to PyPI.
+
+To test the pipeline first, use **Actions → Release to PyPI → Run workflow** and
+pick `testpypi`.
+
 ## Recommended workflow
 
 1. **Report** — run with a `--type`/`-p` filter to see duplicates and total
