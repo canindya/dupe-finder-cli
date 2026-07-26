@@ -1,0 +1,16 @@
+# Build / packaging artifacts
+build/
+dist/
+*.egg-info/
+__pycache__/
+*.py[cod]
+
+# Runtime output from real runs (not source; may contain personal file paths)
+*_report.txt
+recycle_log.json
+deleted.json
+
+# Editor / tooling
+.claude/
+.vscode/
+.idea/
