@@ -9,6 +9,9 @@ __pycache__/
 *_report.txt
 recycle_log.json
 deleted.json
+# Review files written by --review / --dry-run / a declined deletion, including
+# the _unique_dest fallbacks (duplicates_review.1.txt, .2.txt, ...)
+duplicates_review*.txt
 
 # Editor / tooling
 .claude/
