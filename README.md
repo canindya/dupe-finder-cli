@@ -92,18 +92,12 @@ name for each. Running a removed flag prints the replacement rather than a bare
 
 ## Install
 
-It's a single self-contained file — you can just run it:
+From PyPI, as a self-contained command (`dupe-finder`):
 
 ```powershell
-python dupe_finder.py --help
-```
-
-Or install it as a proper command (`dupe-finder`) with pip or pipx:
-
-```powershell
-pipx install .                 # from a checkout
-pip install .                  # into the current environment
-pip install .[recycle]         # also pulls in send2trash for Trash support
+pipx install dupe-finder-cli            # isolated, recommended
+pip install dupe-finder-cli             # into the current environment
+pip install "dupe-finder-cli[recycle]"  # also pulls in send2trash (optional)
 ```
 
 Then:
@@ -111,6 +105,15 @@ Then:
 ```powershell
 dupe-finder --type pdf --dry-run
 ```
+
+Or skip installing entirely — it's one file with no imports beyond the standard
+library, so a checkout runs as-is:
+
+```powershell
+python dupe_finder.py --help
+```
+
+To install from a checkout instead, use `pipx install .` or `pip install .`.
 
 No third-party dependencies are required. `send2trash` is optional (see Recycle
 Bin notes below). Requires Python 3.9+.
@@ -317,23 +320,38 @@ different set of files.
 
 Releases are published to PyPI automatically by
 `.github/workflows/release.yml` using **PyPI Trusted Publishing** (OIDC) — no
-API tokens are stored. One-time setup:
+API tokens are stored. The trusted publisher is already configured (project
+`dupe-finder-cli`, owner `canindya`, workflow `release.yml`, environment
+`pypi`), along with a matching `pypi` environment in the repo settings.
 
-1. On PyPI, add a *trusted publisher* for the project `dupe-finder-cli`:
-   owner `canindya`, repo `dupe-finder-cli`, workflow `release.yml`,
-   environment `pypi`. (Do the same on TestPyPI with environment `testpypi` if
-   you want to dry-run.)
-2. In the GitHub repo settings, create environments named `pypi` (and
-   optionally `testpypi`).
+To cut a release:
 
-Then, to cut a release:
+1. Bump `version` in `pyproject.toml`, update this README if the CLI changed,
+   and commit.
+2. Publish a GitHub Release (tag e.g. `v2.0.1`) — the workflow builds the sdist
+   and wheel, runs `twine check`, and publishes to PyPI.
 
-1. Bump `version` in `pyproject.toml` and commit.
-2. Publish a GitHub Release (tag e.g. `v1.0.1`) — the workflow builds the sdist
-   and wheel and publishes to PyPI.
+**Publishing only ever happens from a published Release.** *Actions → Release to
+PyPI → Run workflow* builds and validates the distributions without publishing,
+so you can check packaging at any time without risking an upload.
 
-To test the pipeline first, use **Actions → Release to PyPI → Run workflow** and
-pick `testpypi`.
+Two things worth knowing:
+
+- **A version number can only be used once.** PyPI refuses re-uploads, so a
+  broken release means burning the number and shipping a patch. Before tagging,
+  build and install locally to be sure:
+
+  ```powershell
+  python -m venv .relcheck
+  .relcheck\Scripts\python -m pip install build twine
+  .relcheck\Scripts\python -m build
+  .relcheck\Scripts\python -m twine check dist/*
+  .relcheck\Scripts\python -m pip install dist\dupe_finder_cli-<version>-py3-none-any.whl
+  .relcheck\Scripts\dupe-finder --help
+  ```
+
+- If a publish fails for an infrastructure reason, fix it and re-run the failed
+  job rather than cutting a new tag: `gh run rerun <run-id> --failed`.
 
 ## Recommended workflow
 
