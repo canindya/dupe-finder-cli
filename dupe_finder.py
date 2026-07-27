@@ -2,11 +2,17 @@
 """
 dupe_finder - Find and remove duplicate files across drives.
 
-Strategy (fast, safe):
+Strategy (thorough, safe) - the default:
   1. Group candidate files by exact size (cheap - no reads).
   2. Within each size group, group by a partial hash of the first 64 KB.
   3. Within each partial-hash group, group by a full-content hash.
   Files sharing the same full hash are byte-for-byte duplicates.
+
+Strategy (--fast) - a lightweight first pass:
+  Group files by (file name, exact size) and read nothing at all. This is
+  seconds instead of minutes, but it is a GUESS: two files with the same name
+  and size can still have different contents. Use it to survey a drive, then
+  confirm anything you intend to delete with a normal (hashing) run.
 
 Deletion always keeps exactly one copy per duplicate group and reports how
 much space will be reclaimed *before* anything is removed. Nothing is deleted
@@ -19,11 +25,17 @@ Examples:
   # Scan specific folders
   python dupe_finder.py -p D:\\Photos -p "E:\\Backup"
 
+  # Quick survey: match on name + size only, no content check
+  python dupe_finder.py -p D:\\Photos --fast
+
   # Ignore tiny files, then interactively delete, keeping the oldest copy
   python dupe_finder.py --min-size 1MB --delete --keep oldest
 
   # Delete without prompting (careful!), writing an undo log
   python dupe_finder.py --delete --keep shortest-path --yes --log deleted.json
+
+Output detail: a live progress line with percentage and ETA by default,
+full per-file detail with -v/--verbose, nothing with -q/--quiet.
 """
 
 from __future__ import annotations
@@ -35,6 +47,7 @@ import os
 import string
 import sys
 import threading
+import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -139,6 +152,104 @@ def human(n: int) -> str:
             return f"{n:.0f} {unit}" if unit == "B" else f"{n:,.2f} {unit}"
         n /= step
     return f"{n} B"
+
+
+def _fmt_clock(seconds: float | None) -> str:
+    """Format a duration as M:SS or H:MM:SS. Returns '--:--' when unknown."""
+    if seconds is None or seconds != seconds or seconds < 0 or seconds > 359_999:
+        return "--:--"
+    s = int(seconds)
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
+
+
+class Progress:
+    """A one-line live progress indicator with percentage and ETA.
+
+    Written to stderr so it never pollutes redirected report output. On a TTY it
+    rewrites a single line; when redirected it prints an occasional line instead
+    (rewriting would produce thousands of junk lines in a log file). Progress is
+    measured in bytes when a byte total is known (far more accurate for hashing,
+    where file sizes vary by orders of magnitude) and in files otherwise. A total
+    of zero means "unknown" - only the running count and elapsed time are shown.
+    Thread-safe: workers call advance() concurrently during parallel hashing."""
+
+    TTY_INTERVAL = 0.2      # seconds between redraws on a terminal
+    FILE_INTERVAL = 15.0    # seconds between appended lines when redirected
+
+    def __init__(self, label: str, total: int = 0, total_bytes: int = 0,
+                 enabled: bool = True):
+        self.label = label
+        self.total = total
+        self.total_bytes = total_bytes
+        self.enabled = enabled
+        self.stream = sys.stderr
+        try:
+            self.tty = self.stream.isatty()
+        except (AttributeError, ValueError):
+            self.tty = False
+        self.done_items = 0
+        self.done_bytes = 0
+        self.start = time.monotonic()
+        self._last_draw = self.start  # wait one interval before the first draw
+        self._width = 0
+        self._lock = threading.Lock()
+
+    def advance(self, nbytes: int = 0, items: int = 1) -> None:
+        if not self.enabled:
+            return
+        with self._lock:
+            self.done_items += items
+            self.done_bytes += nbytes
+            now = time.monotonic()
+            interval = self.TTY_INTERVAL if self.tty else self.FILE_INTERVAL
+            if now - self._last_draw < interval:
+                return
+            self._last_draw = now
+            self._draw(now)
+
+    def finish(self) -> None:
+        """Draw the final state and end the line."""
+        if not self.enabled:
+            return
+        with self._lock:
+            self._draw(time.monotonic(), final=True)
+
+    def _draw(self, now: float, final: bool = False) -> None:
+        elapsed = now - self.start
+        if self.total_bytes:
+            frac = min(1.0, self.done_bytes / self.total_bytes)
+            detail = f"{human(self.done_bytes)} / {human(self.total_bytes)}"
+        elif self.total:
+            frac = min(1.0, self.done_items / self.total)
+            detail = f"{self.done_items:,} / {self.total:,} files"
+        else:
+            frac = None
+            detail = f"{self.done_items:,} files"
+
+        parts = [f"  {self.label}"]
+        if frac is not None:
+            parts.append(f"{frac * 100:5.1f}%")
+        parts.append(detail)
+        if final:
+            parts.append(f"done in {_fmt_clock(elapsed)}")
+        elif frac and elapsed > 1.0:
+            parts.append(f"ETA {_fmt_clock(elapsed / frac - elapsed)}")
+        else:
+            parts.append(f"{_fmt_clock(elapsed)} elapsed")
+        line = " | ".join(parts)
+
+        if self.tty:
+            pad = max(0, self._width - len(line))
+            self.stream.write("\r" + line + " " * pad + ("\n" if final else ""))
+            self._width = 0 if final else len(line)
+        else:
+            self.stream.write(line + "\n")
+        try:
+            self.stream.flush()
+        except (OSError, ValueError):
+            pass
 
 
 def parse_size(s: str) -> int:
@@ -465,7 +576,8 @@ class Scanner:
     exclude: list[str] = field(default_factory=list)          # substring match
     exclude_prefixes: list[str] = field(default_factory=list)  # anchored at root
     extensions: set[str] = field(default_factory=set)  # e.g. {".jpg", ".png"}
-    verbose: bool = False
+    verbose: bool = False        # per-file detail lines
+    show_progress: bool = False  # live one-line counter
 
     def _excluded(self, path: str) -> bool:
         low = path.lower()
@@ -482,9 +594,12 @@ class Scanner:
             return True
         return os.path.splitext(name)[1].lower() in self.extensions
 
-    def collect_by_size(self) -> dict[int, list[str]]:
-        """Walk all roots, bucketing files by size."""
-        by_size: dict[int, list[str]] = defaultdict(list)
+    def _iter_files(self):
+        """Yield (path, size) for every file passing the type/size/exclude
+        filters. Shared by both bucketing strategies so they can never drift."""
+        # The walk has no cheap way to know its total up front, so progress here
+        # is an indeterminate running count rather than a percentage.
+        prog = Progress("scanning ", enabled=self.show_progress)
         seen_files = 0
         for root in self.roots:
             for dirpath, dirnames, filenames in os.walk(root, followlinks=self.follow_symlinks):
@@ -513,28 +628,52 @@ class Scanner:
                         continue
                     if self.max_size is not None and size > self.max_size:
                         continue
-                    by_size[size].append(full)
+                    yield full, size
                     seen_files += 1
+                    prog.advance()
                     if self.verbose and seen_files % 5000 == 0:
                         print(f"  ...scanned {seen_files:,} files", file=sys.stderr)
+        prog.finish()
+
+    def collect_by_size(self) -> dict[int, list[str]]:
+        """Walk all roots, bucketing files by size."""
+        by_size: dict[int, list[str]] = defaultdict(list)
+        for full, size in self._iter_files():
+            by_size[size].append(full)
         # keep only sizes with >1 file — a unique size cannot have a duplicate
         return {s: paths for s, paths in by_size.items() if len(paths) > 1}
 
+    def collect_by_name_size(self) -> dict[tuple[str, int], list[str]]:
+        """Walk all roots, bucketing files by (lowercased name, size).
 
-def _hash_many(paths: list[str], hash_fn, workers: int,
-               label: str, verbose: bool) -> dict[str, str]:
+        This is the whole of --fast mode's matching: no file is ever opened.
+        Names are casefolded because Windows filesystems are case-insensitive
+        and copies frequently differ only in case."""
+        buckets: dict[tuple[str, int], list[str]] = defaultdict(list)
+        for full, size in self._iter_files():
+            buckets[(os.path.basename(full).casefold(), size)].append(full)
+        return {k: paths for k, paths in buckets.items() if len(paths) > 1}
+
+
+def _hash_many(paths: list[str], hash_fn, workers: int, label: str,
+               verbose: bool, progress: "Progress | None" = None,
+               sizes: dict[str, int] | None = None) -> dict[str, str]:
     """Apply *hash_fn(path) -> str|None* to every path concurrently.
 
     Returns {path: hash}, silently dropping paths that hash to None (unreadable
     files). Falls back to a plain sequential loop when workers <= 1 (useful for
-    spinning disks, where parallel reads can thrash the head)."""
+    spinning disks, where parallel reads can thrash the head). When *progress*
+    is given it is advanced per file, by *sizes[path]* bytes if known so the
+    percentage tracks work actually done rather than files touched."""
     result: dict[str, str] = {}
     done = 0
     total = len(paths)
 
-    def _tick() -> None:
+    def _tick(path: str) -> None:
         nonlocal done
         done += 1
+        if progress is not None:
+            progress.advance(sizes.get(path, 0) if sizes else 0)
         if verbose and done % 2000 == 0:
             print(f"  ...{label} {done:,}/{total:,}", file=sys.stderr)
 
@@ -543,7 +682,7 @@ def _hash_many(paths: list[str], hash_fn, workers: int,
             h = hash_fn(p)
             if h is not None:
                 result[p] = h
-            _tick()
+            _tick(p)
         return result
 
     with ThreadPoolExecutor(max_workers=workers) as ex:
@@ -552,13 +691,14 @@ def _hash_many(paths: list[str], hash_fn, workers: int,
             h = fut.result()
             if h is not None:
                 result[futures[fut]] = h
-            _tick()
+            _tick(futures[fut])
     return result
 
 
 def find_duplicates(by_size: dict[int, list[str]], workers: int = 1,
                     cache: "HashCache | None" = None,
-                    verbose: bool = False) -> list[list[str]]:
+                    verbose: bool = False,
+                    show_progress: bool = False) -> list[list[str]]:
     """Refine size groups into confirmed duplicate groups.
 
     Two content passes, each hashing in parallel: a cheap partial hash (first
@@ -575,8 +715,12 @@ def find_duplicates(by_size: dict[int, list[str]], workers: int = 1,
     if verbose:
         print(f"  hashing {len(candidates):,} candidates (partial pass, "
               f"{workers} worker(s))", file=sys.stderr)
+    # The partial pass reads a fixed 64 KB per file, so files are the honest
+    # unit of work here; the full pass below is byte-bound instead.
+    prog = Progress("quick scan", total=len(candidates), enabled=show_progress)
     partial = _hash_many(candidates, lambda p: hash_file(p, PARTIAL_READ),
-                         workers, "partial-hashed", verbose)
+                         workers, "partial-hashed", verbose, prog)
+    prog.finish()
     partial_buckets: dict[tuple[int, str], list[str]] = defaultdict(list)
     for p, ph in partial.items():
         partial_buckets[(size_of[p], ph)].append(p)
@@ -588,12 +732,42 @@ def find_duplicates(by_size: dict[int, list[str]], workers: int = 1,
         print(f"  confirming {len(survivors):,} candidates (full pass)",
               file=sys.stderr)
     full_fn = cache.get_or_compute if cache is not None else (lambda p: hash_file(p))
-    full = _hash_many(survivors, full_fn, workers, "full-hashed", verbose)
+    prog = Progress("full scan ", total=len(survivors), enabled=show_progress,
+                    total_bytes=sum(size_of[p] for p in survivors))
+    full = _hash_many(survivors, full_fn, workers, "full-hashed", verbose,
+                      prog, size_of)
+    prog.finish()
     full_buckets: dict[tuple[int, str], list[str]] = defaultdict(list)
     for p, fh in full.items():
         full_buckets[(size_of[p], fh)].append(p)
 
     return [grp for grp in full_buckets.values() if len(grp) > 1]
+
+
+def find_duplicates_fast(by_name_size: dict[tuple[str, int], list[str]]
+                         ) -> list[list[str]]:
+    """--fast mode: treat same-name + same-size files as duplicates.
+
+    No file is opened, so this is orders of magnitude quicker than hashing --
+    and strictly a heuristic. Same name + same size is strong evidence for
+    copies made by a file manager or a backup tool, but it is NOT proof: two
+    different edits of report.docx can easily land on the same byte count.
+    Callers must label these groups as unverified (see report())."""
+    return [sorted(paths) for paths in by_name_size.values() if len(paths) > 1]
+
+
+FAST_WARNING = (
+    "!! FAST MODE: files were matched on NAME + SIZE only. Their contents were\n"
+    "!! never read, so these groups are LIKELY duplicates, not confirmed ones.\n"
+    "!! Re-run without --fast to verify by content before deleting anything."
+)
+
+# Short form for the deletion plan, where the full banner has just been printed
+# by report() a few lines above.
+FAST_UNVERIFIED_NOTE = (
+    "!! These matches are UNVERIFIED (--fast: name + size only, contents never "
+    "read)."
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -604,8 +778,16 @@ def group_wasted(size: int, count: int) -> int:
     return size * (count - 1)
 
 
-def report(groups: list[list[str]]) -> int:
-    """Print duplicate groups and return total reclaimable bytes."""
+TOP_GROUPS = 20  # groups listed in non-verbose mode; -v lists them all
+
+
+def report(groups: list[list[str]], verified: bool = True,
+           limit: int | None = None) -> int:
+    """Print duplicate groups and return total reclaimable bytes.
+
+    *limit* caps how many groups are listed (largest first); the totals always
+    cover every group. Pass None to list them all (-v). *verified* is False for
+    --fast results, which are labelled as unconfirmed."""
     if not groups:
         print("\nNo duplicate files found.")
         return 0
@@ -616,6 +798,8 @@ def report(groups: list[list[str]]) -> int:
     groups_sorted = sorted(
         groups, key=lambda g: os.path.getsize(g[0]) * (len(g) - 1), reverse=True
     )
+    heading = "copies" if verified else "likely copies"
+    listed = 0
     for i, g in enumerate(groups_sorted, 1):
         try:
             size = os.path.getsize(g[0])
@@ -624,16 +808,27 @@ def report(groups: list[list[str]]) -> int:
         waste = group_wasted(size, len(g))
         total_waste += waste
         total_dupes += len(g) - 1
-        print(f"\n[{i}] {len(g)} copies | {human(size)} each | "
+        if limit is not None and listed >= limit:
+            continue  # keep totalling, just stop printing
+        listed += 1
+        print(f"\n[{i}] {len(g)} {heading} | {human(size)} each | "
               f"reclaimable {human(waste)}")
         for p in g:
             print(f"      {p}")
 
+    if limit is not None and len(groups_sorted) > listed:
+        print(f"\n...and {len(groups_sorted) - listed:,} more group(s). "
+              "Use -v to list them all.")
+
     print("\n" + "=" * 60)
-    print(f"Duplicate groups : {len(groups):,}")
+    label = "Duplicate groups " if verified else "Possible dupe groups"
+    print(f"{label}: {len(groups):,}")
     print(f"Redundant files  : {total_dupes:,}")
-    print(f"Reclaimable space: {human(total_waste)}")
+    print(f"Reclaimable space: {human(total_waste)}"
+          + ("" if verified else "  (if the matches are real)"))
     print("=" * 60)
+    if not verified:
+        print(FAST_WARNING)
     return total_waste
 
 
@@ -679,7 +874,7 @@ def delete_duplicates(groups: list[list[str]], strategy: str,
                       assume_yes: bool, log_path: str | None,
                       interactive: bool, recycle: bool = False,
                       prefer: list[str] | None = None,
-                      dry_run: bool = False) -> None:
+                      dry_run: bool = False, verified: bool = True) -> None:
     """Delete redundant copies, keeping one per group. Reports savings first."""
     # Build the deletion plan.
     plan: list[tuple[str, list[str]]] = []  # (keeper, [to_delete])
@@ -714,6 +909,8 @@ def delete_duplicates(groups: list[list[str]], strategy: str,
         print(f"  Groups affected : {len(plan):,}")
         print(f"  Files that would be removed : {files_to_go:,}")
         print(f"  Space that would be reclaimed: {human(planned_bytes)}")
+        if not verified:
+            print(f"\n{FAST_UNVERIFIED_NOTE}")
         return
 
     action = "recycle" if recycle else "delete"
@@ -722,6 +919,11 @@ def delete_duplicates(groups: list[list[str]], strategy: str,
     print(f"  Files to {action}: {sum(len(v) for _, v in plan):,}")
     print(f"  Space to reclaim: {human(planned_bytes)}"
           + ("  (files go to the Recycle Bin)" if recycle else ""))
+    if not verified:
+        print(f"\n{FAST_UNVERIFIED_NOTE}")
+        if not recycle:
+            print("!! Deleting them permanently is IRREVERSIBLE. Consider "
+                  "--recycle.")
 
     if interactive:
         _interactive_delete(plan, log_path, recycle)
@@ -729,8 +931,11 @@ def delete_duplicates(groups: list[list[str]], strategy: str,
 
     if not assume_yes:
         verb = "recycling" if recycle else "deletion"
-        ans = input(f"\nProceed with {verb}? Type 'yes' to confirm: ").strip().lower()
-        if ans != "yes":
+        # Unverified matches demand a deliberate phrase, not a reflexive 'yes'.
+        phrase = "yes" if verified else "delete unverified"
+        ans = input(f"\nProceed with {verb}? "
+                    f"Type '{phrase}' to confirm: ").strip().lower()
+        if ans != phrase:
             print("Aborted. No files removed.")
             return
 
@@ -830,6 +1035,12 @@ def build_parser() -> argparse.ArgumentParser:
                         f"{', '.join(sorted(CATEGORIES))} (with synonyms like "
                         "'video', 'audio', 'images'). Repeatable/comma-separated; "
                         "combines with --type.")
+    p.add_argument("--fast", "--quick", "--name-size", action="store_true",
+                   dest="fast",
+                   help="Lightweight first pass: match files on NAME + SIZE "
+                        "only, without reading their contents. Much faster, but "
+                        "results are unverified guesses - confirm with a normal "
+                        "run before deleting.")
     p.add_argument("--exclude", action="append", default=[], metavar="SUBSTR",
                    help="Skip paths containing this substring (repeatable).")
     p.add_argument("--follow-symlinks", action="store_true",
@@ -862,8 +1073,12 @@ def build_parser() -> argparse.ArgumentParser:
                         "Unchanged files are not re-hashed on repeat runs.")
     p.add_argument("--no-cache", action="store_true",
                    help="Disable the persistent hash cache for this run.")
+    p.add_argument("-v", "--verbose", action="store_true",
+                   help="Show full detail: every duplicate group and per-file "
+                        "scanning/hashing lines. Default is a single progress "
+                        "line with a percentage and ETA.")
     p.add_argument("-q", "--quiet", action="store_true",
-                   help="Suppress progress output.")
+                   help="Suppress all progress output (report only).")
     return p
 
 
@@ -897,8 +1112,13 @@ def main(argv: list[str] | None = None) -> int:
 
     extensions = normalize_extensions(args.types) | expand_categories(args.categories)
 
-    verbose = not args.quiet
-    print(f"Scanning: {', '.join(roots)}")
+    # Three levels of output: -q (silent), default (one live progress line),
+    # -v (per-file detail plus every duplicate group). -q wins if both given.
+    verbose = args.verbose and not args.quiet
+    show_progress = not args.quiet and not args.verbose
+
+    print(f"Scanning: {', '.join(roots)}"
+          + ("   [FAST: name + size only]" if args.fast else ""))
     if args.categories:
         print(f"Categories: {', '.join(args.categories)}")
     if extensions:
@@ -907,6 +1127,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Excluding paths containing: {', '.join(excludes)}")
     if exclude_prefixes:
         print(f"Excluding system locations: {', '.join(exclude_prefixes)}")
+
+    # stdout is block-buffered when redirected; flush so the header above can't
+    # land after the stderr progress lines in a log file.
+    sys.stdout.flush()
 
     scanner = Scanner(
         roots=roots,
@@ -917,21 +1141,34 @@ def main(argv: list[str] | None = None) -> int:
         exclude_prefixes=exclude_prefixes,
         extensions=extensions,
         verbose=verbose,
+        show_progress=show_progress,
     )
 
-    by_size = scanner.collect_by_size()
-    if verbose:
-        print(f"Size groups with potential dupes: {len(by_size):,}", file=sys.stderr)
+    if args.fast:
+        # No hashing at all: one walk, bucket by (name, size), done.
+        by_name_size = scanner.collect_by_name_size()
+        if verbose:
+            print(f"Name+size groups with >1 file: {len(by_name_size):,}",
+                  file=sys.stderr)
+        groups = find_duplicates_fast(by_name_size)
+    else:
+        by_size = scanner.collect_by_size()
+        if verbose:
+            print(f"Size groups with potential dupes: {len(by_size):,}",
+                  file=sys.stderr)
 
-    cache = HashCache(args.cache or default_cache_path(), enabled=not args.no_cache)
-    groups = find_duplicates(by_size, workers=max(1, args.workers),
-                             cache=cache, verbose=verbose)
-    cache.save()
-    if verbose and cache.enabled and (cache.hits or cache.misses):
-        print(f"Hash cache: {cache.hits:,} hit(s), {cache.misses:,} miss(es)",
-              file=sys.stderr)
+        cache = HashCache(args.cache or default_cache_path(),
+                          enabled=not args.no_cache)
+        groups = find_duplicates(by_size, workers=max(1, args.workers),
+                                 cache=cache, verbose=verbose,
+                                 show_progress=show_progress)
+        cache.save()
+        if verbose and cache.enabled and (cache.hits or cache.misses):
+            print(f"Hash cache: {cache.hits:,} hit(s), {cache.misses:,} miss(es)",
+                  file=sys.stderr)
 
-    total_waste = report(groups)
+    total_waste = report(groups, verified=not args.fast,
+                         limit=None if verbose else TOP_GROUPS)
 
     do_delete = args.delete or args.recycle or args.dry_run
     if do_delete and groups and total_waste > 0:
@@ -944,6 +1181,7 @@ def main(argv: list[str] | None = None) -> int:
             recycle=args.recycle,
             prefer=args.prefer,
             dry_run=args.dry_run,
+            verified=not args.fast,
         )
     elif do_delete:
         print("Nothing to delete.")

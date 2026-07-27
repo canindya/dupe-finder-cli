@@ -18,6 +18,48 @@ Only files with an identical full-content hash are reported as duplicates, so
 same-size-but-different files are never falsely matched. Both hash passes run in
 parallel across worker threads (tunable with `--workers`).
 
+### `--fast`: a lightweight first pass
+
+For a quick survey of a big drive, `--fast` skips hashing entirely and matches
+files on **file name + exact size** alone. Nothing is ever read from disk, so it
+finishes in seconds rather than minutes.
+
+The trade-off is that it's a *heuristic*, not a proof:
+
+- **False positives** — two different edits of `report.docx` can easily end up
+  the same size. `--fast` would call them duplicates; they aren't.
+- **False negatives** — an identical file saved under a different name (say
+  `song.mp3` and `song (1).mp3`) is invisible to `--fast`, but a normal run
+  finds it.
+
+So results are labelled *likely copies*, the summary carries a warning, and if
+you go on to delete them the confirmation prompt asks you to type
+`delete unverified` rather than a reflexive `yes`. Use it to find out **where**
+your duplicates are, then re-run without `--fast` (optionally narrowed to that
+folder) to confirm by content before deleting.
+
+## Progress output
+
+Long scans report progress on a single live line — percentage complete, work
+done vs. total, and an estimated time remaining:
+
+```
+  full scan  |  42.7% | 18.30 GB / 42.86 GB | ETA 3:12
+```
+
+The hashing phase measures progress in **bytes**, not files, so the ETA isn't
+thrown off by a mix of tiny and huge files. Three levels of detail:
+
+| Flag | Output |
+|---|---|
+| *(default)* | Live progress line + the 20 largest duplicate groups + totals. |
+| `-v, --verbose` | Per-file scanning/hashing detail and **every** duplicate group. |
+| `-q, --quiet` | No progress at all; just the report. |
+
+Progress goes to stderr, so `python dupe_finder.py > report.txt` keeps the
+report clean while you still watch progress on screen. When stderr is
+redirected, progress is appended as occasional lines instead of a rewritten one.
+
 ## Install
 
 It's a single self-contained file — you can just run it:
@@ -54,6 +96,10 @@ python dupe_finder.py -p D:\Photos -p "E:\Backup"
 
 # Ignore files under 1 MB
 python dupe_finder.py --min-size 1MB
+
+# Quick survey: match on name + size only, never read file contents
+python dupe_finder.py -p D:\Photos --fast
+python dupe_finder.py --fast --min-size 10MB   # where are the big duplicates?
 
 # Only look at specific file types (comma-separated or repeated; dot optional)
 python dupe_finder.py --type jpg,png,gif
@@ -101,6 +147,9 @@ python dupe_finder.py --type pdf --no-cache   # force a full re-hash
   of deleting them permanently.
 - `--log FILE` writes a JSON record of every removed file and the copy it was
   kept against.
+- With `--fast`, matches are unverified, so the confirmation prompt requires the
+  phrase `delete unverified` instead of `yes`. Prefer `--recycle` there, and
+  ideally confirm by content first.
 
 > **Recycle Bin caveat:** the bin has a per-drive size cap. Files larger than
 > the available quota are **permanently deleted** rather than recycled (Windows
@@ -113,6 +162,7 @@ python dupe_finder.py --type pdf --no-cache   # force a full re-hash
 |---|---|
 | `-p, --path DIR` | Directory to scan (repeatable). Default: all drives. |
 | `-t, --type, --ext EXT` | Only scan these extensions, e.g. `jpg,png` (repeatable, leading dot optional, case-insensitive). Default: all files. |
+| `--fast, --quick, --name-size` | Lightweight first pass: match on **name + size only**, without reading file contents. Much faster, but results are unverified guesses — see [`--fast`](#fast-a-lightweight-first-pass). |
 | `-c, --category, --kind NAME` | Only scan a file-type category: `movies`, `music`, `photos`, `documents`, `ebooks`, `archives`, `code` (plus synonyms like `video`, `audio`, `images`). Repeatable/comma-separated; combines with `--type`. |
 | `--min-size SIZE` | Ignore files smaller than this (e.g. `1MB`). Default `1`. |
 | `--max-size SIZE` | Ignore files larger than this. |
@@ -129,7 +179,8 @@ python dupe_finder.py --type pdf --no-cache   # force a full re-hash
 | `--workers N` | Parallel hashing threads (default: based on CPU count). Use `1` for spinning disks where parallel reads thrash. |
 | `--cache FILE` | Persistent hash-cache file (default: per-user cache dir). Unchanged files aren't re-hashed on repeat runs. |
 | `--no-cache` | Disable the persistent hash cache for this run. |
-| `-q, --quiet` | Suppress progress output. |
+| `-v, --verbose` | Show full detail: every duplicate group plus per-file scanning/hashing lines (replaces the progress line). |
+| `-q, --quiet` | Suppress all progress output; print the report only. |
 
 ## Notes
 
@@ -144,7 +195,7 @@ python dupe_finder.py --type pdf --no-cache   # force a full re-hash
   - Unix defaults are **anchored at the root**, so a user folder like
     `~/dev` or `~/var` is never mistaken for `/dev` or `/var`.
 - Scanning entire drives can take a while and touch many files; start with a
-  single folder or a `--min-size` filter to get a feel for it.
+  single folder, a `--min-size` filter, or a `--fast` survey to get a feel for it.
 - Hashing is multi-threaded by default. On **SSDs/NVMe** this is a big speedup;
   on a single **spinning HDD**, parallel reads can thrash the head — pass
   `--workers 1` there.
@@ -190,8 +241,10 @@ pick `testpypi`.
 
 ## Recommended workflow
 
+0. **Survey (optional)** — `--fast` over a big drive to see roughly where the
+   duplicates live, in seconds. Treat the numbers as an estimate.
 1. **Report** — run with a `--type`/`-p` filter to see duplicates and total
-   reclaimable space.
+   reclaimable space, verified by content.
 2. **Preview** — add `--dry-run` (plus `--prefer`/`--keep`) to confirm the exact
    plan and where deletions would land.
 3. **Act** — swap `--dry-run` for `--recycle` (or `--delete`) and add `--log` to
