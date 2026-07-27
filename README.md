@@ -116,8 +116,8 @@ python dupe_finder.py --delete --keep oldest
 # Decide group-by-group interactively (or press 'i' at the confirmation prompt)
 python dupe_finder.py --delete --interactive
 
-# Save the plan somewhere specific to read before committing to it
-python dupe_finder.py --category movies --recycle --review movie_dupes.txt
+# Just write a reviewable plan to a file - deletes nothing, never prompts
+python dupe_finder.py --category movies --review movie_dupes.txt
 
 # Delete without a final prompt, writing a JSON record of what was removed
 python dupe_finder.py --delete --keep shortest-path --yes --log deleted.json
@@ -153,8 +153,9 @@ Choice:
 
 - **`i`** walks the groups one at a time showing `[12/340]`, the copy being kept
   and the copies being removed. Answer `y` / `n` per group, `a` to accept the
-  current group **and all remaining**, or `q` to stop (everything you already
-  approved is still carried out).
+  current group **and all remaining**, `s` to save the full plan without losing
+  your place, or `q` to stop (everything you already approved is still carried
+  out, and the groups you never got to are written to the review file).
 - **`s`** writes the review file and returns to the prompt, so you can open it in
   another window and then decide right here.
 - **`n`** aborts *and* saves the review file first.
@@ -172,6 +173,17 @@ lists every group largest-first with the keeper and the victims marked:
 
 It is also written automatically by `--dry-run`. If you do abort and come back
 later, the re-run is much faster — the full-content hashes are already cached.
+
+`--review` works **on its own** as a read-only mode — no deletion flag needed,
+no prompt, nothing removed:
+
+```powershell
+python dupe_finder.py --category movies --review movie_dupes.txt
+```
+
+That's the shortest way to get a complete, reviewable list of what the tool
+would do. (A plain run with no flags at all still writes nothing, so you never
+get a file you didn't ask for.)
 
 ## Deletion safety
 
@@ -216,7 +228,7 @@ later, the re-run is much faster — the full-content hashes are already cached.
 | `--interactive` | Confirm each duplicate group individually. |
 | `--yes` | Skip the final confirmation prompt. |
 | `--log FILE` | Write a JSON log of deleted files. |
-| `--review FILE` | Where to write the human-readable plan (default `./duplicates_review.txt`). Written automatically on `--dry-run` and whenever you decline the prompt. |
+| `--review FILE` | Write the human-readable plan to FILE. **On its own it's a read-only mode** — nothing is deleted, no prompt. Also written automatically on `--dry-run` and whenever you decline or stop a deletion (default `./duplicates_review.txt`). |
 | `--workers N` | Parallel hashing threads (default: based on CPU count). Use `1` for spinning disks where parallel reads thrash. |
 | `--cache FILE` | Persistent hash-cache file (default: per-user cache dir). Unchanged files aren't re-hashed on repeat runs. |
 | `--no-cache` | Disable the persistent hash cache for this run. |

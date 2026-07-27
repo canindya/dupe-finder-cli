@@ -993,7 +993,8 @@ def delete_duplicates(groups: list[list[str]], strategy: str,
                       prefer: list[str] | None = None,
                       dry_run: bool = False, verified: bool = True,
                       review_path: str | None = None,
-                      review_explicit: bool = False) -> None:
+                      review_explicit: bool = False,
+                      review_only: bool = False) -> None:
     """Delete redundant copies, keeping one per group. Reports savings first."""
     # Build the deletion plan.
     plan: list[tuple[str, list[str]]] = []  # (keeper, [to_delete])
@@ -1022,9 +1023,12 @@ def delete_duplicates(groups: list[list[str]], strategy: str,
         print(f"  Groups with no preferred copy (fell back to '{strategy}'): "
               f"{fallback_groups:,}")
 
-    if dry_run:
+    # Both --dry-run and a standalone --review build the full plan, write it
+    # out and stop: no prompt, nothing removed.
+    if dry_run or review_only:
         files_to_go = sum(len(v) for _, v in plan)
-        print(f"\n[DRY RUN] No files will be removed.")
+        print("\n[DRY RUN] No files will be removed." if dry_run
+              else "\nReview only. No files will be removed.")
         print(f"  Groups affected : {len(plan):,}")
         print(f"  Files that would be removed : {files_to_go:,}")
         print(f"  Space that would be reclaimed: {human(planned_bytes)}")
@@ -1048,8 +1052,11 @@ def delete_duplicates(groups: list[list[str]], strategy: str,
             print("!! Deleting them permanently is IRREVERSIBLE. Consider "
                   "--recycle.")
 
+    review_kw = dict(strategy=strategy, verified=verified,
+                     review_path=review_path, review_explicit=review_explicit)
+
     if interactive:
-        _interactive_delete(plan, log_path, recycle)
+        _interactive_delete(plan, log_path, recycle, **review_kw)
         return
 
     if not assume_yes:
@@ -1061,7 +1068,7 @@ def delete_duplicates(groups: list[list[str]], strategy: str,
         if choice == "abort":
             return
         if choice == "interactive":
-            _interactive_delete(plan, log_path, recycle)
+            _interactive_delete(plan, log_path, recycle, **review_kw)
             return
 
     deleted, freed, errors = _do_delete(
@@ -1071,39 +1078,77 @@ def delete_duplicates(groups: list[list[str]], strategy: str,
 
 
 def _interactive_delete(plan: list[tuple[str, list[str]]], log_path: str | None,
-                        recycle: bool = False) -> None:
+                        recycle: bool = False, *, strategy: str = "",
+                        verified: bool = True, review_path: str | None = None,
+                        review_explicit: bool = False) -> None:
+    """Step through the plan one group at a time.
+
+    Like the confirm menu, this must never leave a completed scan with nothing
+    to show for it: 's' saves the plan mid-review, and stopping without acting
+    writes a review of whatever was left undecided."""
     to_delete: list[tuple[str, str]] = []  # (victim, keeper)
     verb = "recycle" if recycle else "delete"
     total = len(plan)
-    for i, (keeper, victims) in enumerate(plan, 1):
+    saved: str | None = None  # reuse one review file across repeated saves
+    i = 0
+
+    def _save(groups: list[tuple[str, list[str]]], what: str) -> str | None:
+        """Write a review once and report it. Later calls reuse that file rather
+        than spawning duplicates.1.txt, duplicates.2.txt, ..."""
+        nonlocal saved
+        if saved is not None:
+            print(f"Review already written to: {saved}")
+            return saved
+        saved = write_review(groups, review_path, strategy, recycle,
+                             verified, review_explicit)
+        if saved:
+            print(f"Review of {what} written to: {saved}")
+        return saved
+
+    while i < total:
+        keeper, victims = plan[i]
         try:
             size = os.path.getsize(keeper)
         except OSError:
             size = 0
         print("\n" + "-" * 60)
-        print(f"[{i}/{total}]")
+        print(f"[{i + 1}/{total}]")
         print(f"KEEP:   {keeper}")
         for v in victims:
             print(f"{verb}: {v}")
         print(f"reclaims {human(size * len(victims))}")
         try:
             ans = input(f"[y] {verb} these  [n] skip  "
-                        f"[a] {verb} these and ALL remaining  [q] stop: "
-                        ).strip().lower()
+                        f"[a] {verb} these and ALL remaining  "
+                        f"[s] save review  [q] stop: ").strip().lower()
         except (EOFError, KeyboardInterrupt):
             print()
             ans = "q"
+
+        if ans == "s":
+            # Save the whole plan and re-show this group; don't advance.
+            _save(plan, f"all {total:,} group(s)")
+            continue
         if ans == "q":
+            # Leave a record of what was never decided on.
+            remaining = plan[i:]
+            print("Stopped.")
+            if remaining:
+                _save(remaining, f"the {len(remaining):,} undecided group(s)")
             break
         if ans == "a":
             # Accept this group and every one left, without more prompting.
-            for k, vs in plan[i - 1:]:
+            for k, vs in plan[i:]:
                 to_delete.extend((v, k) for v in vs)
             break
         if ans == "y":
             to_delete.extend((v, keeper) for v in victims)
+        i += 1
+
     if not to_delete:
         print("No files selected. Nothing removed.")
+        if saved is None:  # a 'q' or 's' earlier already reported one
+            _save(plan, "the full plan")
         return
     deleted, freed, errors = _do_delete(to_delete, recycle)
     _finish(deleted, freed, errors, log_path, recycle)
@@ -1204,10 +1249,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--log", default=None, metavar="FILE",
                    help="Write a JSON log of deleted files.")
     p.add_argument("--review", default=None, metavar="FILE",
-                   help="Where to write the human-readable review of the "
-                        f"deletion plan (default: ./{DEFAULT_REVIEW}). Written "
-                        "automatically on --dry-run and whenever you decline "
-                        "the confirmation, so a long scan is never wasted.")
+                   help="Write a human-readable review of the plan (which copy "
+                        "is kept, which are removed) to FILE. On its own this "
+                        "is a read-only mode: nothing is deleted and you are "
+                        "never prompted. A review is also written automatically "
+                        "on --dry-run, and whenever you decline or stop a "
+                        f"deletion, so a long scan is never wasted (default "
+                        f"location: ./{DEFAULT_REVIEW}).")
     p.add_argument("--workers", type=int, default=default_workers(), metavar="N",
                    help=f"Parallel hashing threads (default: {default_workers()}). "
                         "Use 1 for spinning disks where parallel reads thrash.")
@@ -1314,7 +1362,10 @@ def main(argv: list[str] | None = None) -> int:
                          limit=None if verbose else TOP_GROUPS)
 
     do_delete = args.delete or args.recycle or args.dry_run
-    if do_delete and groups and total_waste > 0:
+    # --review on its own is a read-only mode: build the plan, write it out,
+    # delete nothing, never prompt.
+    review_only = args.review is not None and not do_delete
+    if (do_delete or review_only) and groups and total_waste > 0:
         delete_duplicates(
             groups,
             strategy=args.keep,
@@ -1327,7 +1378,10 @@ def main(argv: list[str] | None = None) -> int:
             verified=not args.fast,
             review_path=args.review,
             review_explicit=args.review is not None,
+            review_only=review_only,
         )
+    elif review_only:
+        print("No duplicates to review.")
     elif do_delete:
         print("Nothing to delete.")
 
