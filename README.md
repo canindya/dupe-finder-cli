@@ -113,8 +113,11 @@ python dupe_finder.py --category photos,documents
 # Report, then delete redundant copies keeping the OLDEST one, prompt to confirm
 python dupe_finder.py --delete --keep oldest
 
-# Decide group-by-group interactively
+# Decide group-by-group interactively (or press 'i' at the confirmation prompt)
 python dupe_finder.py --delete --interactive
+
+# Save the plan somewhere specific to read before committing to it
+python dupe_finder.py --category movies --recycle --review movie_dupes.txt
 
 # Delete without a final prompt, writing a JSON record of what was removed
 python dupe_finder.py --delete --keep shortest-path --yes --log deleted.json
@@ -134,11 +137,48 @@ python dupe_finder.py --type pdf              # second run is much faster
 python dupe_finder.py --type pdf --no-cache   # force a full re-hash
 ```
 
+## Deciding at the prompt
+
+After a `--delete` / `--recycle` scan you get the plan and a prompt. It is not a
+yes-or-lose-your-scan choice — you can act on the results without ever re-running:
+
+```
+Proceed with recycling?
+  yes                - recycle all 1,234 file(s) above
+  i                  - review and decide group by group
+  s                  - save a review file, then ask again
+  n                  - abort (a review file is saved first)
+Choice:
+```
+
+- **`i`** walks the groups one at a time showing `[12/340]`, the copy being kept
+  and the copies being removed. Answer `y` / `n` per group, `a` to accept the
+  current group **and all remaining**, or `q` to stop (everything you already
+  approved is still carried out).
+- **`s`** writes the review file and returns to the prompt, so you can open it in
+  another window and then decide right here.
+- **`n`** aborts *and* saves the review file first.
+- A typo re-prompts instead of aborting. An unrecognised answer never deletes.
+
+The review file (`duplicates_review.txt` by default, `--review FILE` to choose)
+lists every group largest-first with the keeper and the victims marked:
+
+```
+[1] 3 copies | 1.20 GB each | reclaimable 2.40 GB
+    KEEP    D:\Movies\Arrival.mkv
+    remove  E:\Backup\Arrival.mkv
+    remove  F:\old\Arrival.mkv
+```
+
+It is also written automatically by `--dry-run`. If you do abort and come back
+later, the re-run is much faster — the full-content hashes are already cached.
+
 ## Deletion safety
 
 - Nothing is ever deleted in plain report mode (the default).
 - Even with `--delete`, you get a **summary of space to reclaim and a
   confirmation prompt** first (unless you pass `--yes`).
+- Declining always leaves you a review file, so a long scan is never wasted.
 - `--dry-run` shows exactly what would be removed (and how much space) without
   touching any files.
 - Every group always keeps one copy — you choose which with `--keep`, and can
@@ -176,6 +216,7 @@ python dupe_finder.py --type pdf --no-cache   # force a full re-hash
 | `--interactive` | Confirm each duplicate group individually. |
 | `--yes` | Skip the final confirmation prompt. |
 | `--log FILE` | Write a JSON log of deleted files. |
+| `--review FILE` | Where to write the human-readable plan (default `./duplicates_review.txt`). Written automatically on `--dry-run` and whenever you decline the prompt. |
 | `--workers N` | Parallel hashing threads (default: based on CPU count). Use `1` for spinning disks where parallel reads thrash. |
 | `--cache FILE` | Persistent hash-cache file (default: per-user cache dir). Unchanged files aren't re-hashed on repeat runs. |
 | `--no-cache` | Disable the persistent hash cache for this run. |
