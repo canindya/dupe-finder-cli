@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dupe-finder-cli"
-version = "1.0.0"
+version = "2.0.0"
 description = "Find and remove duplicate files across drives, safely (report, dry-run, Recycle Bin, keep-one-per-group)."
 readme = "README.md"
 requires-python = ">=3.9"

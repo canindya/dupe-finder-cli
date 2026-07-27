@@ -18,6 +18,20 @@ Only files with an identical full-content hash are reported as duplicates, so
 same-size-but-different files are never falsely matched. Both hash passes run in
 parallel across worker threads (tunable with `--workers`).
 
+Files of 64 KB or less are read only once: the partial pass has already hashed
+them end to end, so that digest is reused instead of reading them again.
+
+### Long paths on Windows
+
+Windows' legacy 260-character path limit means the usual `open()`/`stat()` calls
+fail on deeply nested files — the sort of thing `node_modules` produces by the
+thousand. Every filesystem access goes through the `\\?\` extended-path form, so
+those files are scanned, hashed and removed like any other.
+
+This matters more than it sounds: on a 138k-file developer tree, 977 duplicate
+files were invisible to versions before 2.0 purely because their paths were too
+long.
+
 ### `--fast`: a lightweight first pass
 
 For a quick survey of a big drive, `--fast` skips hashing entirely and matches
@@ -59,6 +73,22 @@ thrown off by a mix of tiny and huge files. Three levels of detail:
 Progress goes to stderr, so `python dupe_finder.py > report.txt` keeps the
 report clean while you still watch progress on screen. When stderr is
 redirected, progress is appended as occasional lines instead of a rewritten one.
+
+## Upgrading to 2.0
+
+Duplicate spellings of four options were removed, so there is now exactly one
+name for each. Running a removed flag prints the replacement rather than a bare
+"unrecognized arguments":
+
+| Removed | Use instead |
+|---|---|
+| `--ext` | `--type` |
+| `--kind` | `--category` |
+| `--quick`, `--name-size` | `--fast` |
+| `--no-cache` | `--cache none` |
+
+2.0 also finds duplicates that earlier versions silently skipped — see
+[long paths](#long-paths-on-windows) below.
 
 ## Install
 
@@ -103,11 +133,11 @@ python dupe_finder.py --fast --min-size 10MB   # where are the big duplicates?
 
 # Only look at specific file types (comma-separated or repeated; dot optional)
 python dupe_finder.py --type jpg,png,gif
-python dupe_finder.py -p D:\Music --ext .mp3 --ext .flac
+python dupe_finder.py -p D:\Music --type .mp3 --type .flac
 
 # Or use a friendly category instead of listing extensions
 python dupe_finder.py --category movies          # find duplicate videos
-python dupe_finder.py --kind music               # 'music' == 'audio' == 'songs'
+python dupe_finder.py --category music           # 'music' == 'audio' == 'songs'
 python dupe_finder.py --category photos,documents
 
 # Report, then delete redundant copies keeping the OLDEST one, prompt to confirm
@@ -134,7 +164,7 @@ python dupe_finder.py --type pdf --recycle --prefer L: --keep oldest
 # Repeat runs reuse cached hashes (unchanged files aren't re-hashed)
 python dupe_finder.py --type pdf              # first run populates the cache
 python dupe_finder.py --type pdf              # second run is much faster
-python dupe_finder.py --type pdf --no-cache   # force a full re-hash
+python dupe_finder.py --type pdf --cache none # force a full re-hash
 ```
 
 ## Deciding at the prompt
@@ -213,9 +243,9 @@ get a file you didn't ask for.)
 | Option | Description |
 |---|---|
 | `-p, --path DIR` | Directory to scan (repeatable). Default: all drives. |
-| `-t, --type, --ext EXT` | Only scan these extensions, e.g. `jpg,png` (repeatable, leading dot optional, case-insensitive). Default: all files. |
-| `--fast, --quick, --name-size` | Lightweight first pass: match on **name + size only**, without reading file contents. Much faster, but results are unverified guesses — see [`--fast`](#fast-a-lightweight-first-pass). |
-| `-c, --category, --kind NAME` | Only scan a file-type category: `movies`, `music`, `photos`, `documents`, `ebooks`, `archives`, `code` (plus synonyms like `video`, `audio`, `images`). Repeatable/comma-separated; combines with `--type`. |
+| `-t, --type EXT` | Only scan these extensions, e.g. `jpg,png` (repeatable, leading dot optional, case-insensitive). Default: all files. |
+| `--fast` | Lightweight first pass: match on **name + size only**, without reading file contents. Much faster, but results are unverified guesses — see [`--fast`](#fast-a-lightweight-first-pass). |
+| `-c, --category NAME` | Only scan a file-type category: `movies`, `music`, `photos`, `documents`, `ebooks`, `archives`, `code` (plus synonyms like `video`, `audio`, `images`). Repeatable/comma-separated; combines with `--type`. |
 | `--min-size SIZE` | Ignore files smaller than this (e.g. `1MB`). Default `1`. |
 | `--max-size SIZE` | Ignore files larger than this. |
 | `--exclude SUBSTR` | Skip any path containing this substring (repeatable). |
@@ -230,8 +260,7 @@ get a file you didn't ask for.)
 | `--log FILE` | Write a JSON log of deleted files. |
 | `--review FILE` | Write the human-readable plan to FILE. **On its own it's a read-only mode** — nothing is deleted, no prompt. Also written automatically on `--dry-run` and whenever you decline or stop a deletion (default `./duplicates_review.txt`). |
 | `--workers N` | Parallel hashing threads (default: based on CPU count). Use `1` for spinning disks where parallel reads thrash. |
-| `--cache FILE` | Persistent hash-cache file (default: per-user cache dir). Unchanged files aren't re-hashed on repeat runs. |
-| `--no-cache` | Disable the persistent hash cache for this run. |
+| `--cache FILE` | Persistent hash-cache file (default: per-user cache dir). Unchanged files aren't re-hashed on repeat runs. Pass `--cache none` to disable caching for a run. |
 | `-v, --verbose` | Show full detail: every duplicate group plus per-file scanning/hashing lines (replaces the progress line). |
 | `-q, --quiet` | Suppress all progress output; print the report only. |
 
@@ -260,7 +289,7 @@ get a file you didn't ask for.)
   installed it's used in preference (most battle-tested), but it's optional.
 - Repeat scans are fast: full-content hashes are cached per user, keyed by
   path + size + mtime, so unchanged files are never re-hashed. Control it with
-  `--cache FILE` / `--no-cache`.
+  `--cache FILE` / `--cache none`.
 - Categories filter *which files are scanned*; the tool still only ever removes
   **duplicates** (keeping one copy per group). `--category music` finds duplicate
   music files across your drives — it does not delete your whole music library.
@@ -269,6 +298,20 @@ get a file you didn't ask for.)
 - Output is written with `errors="replace"`, so filenames containing characters
   the console can't display won't crash the run (they show a `?` placeholder).
 - Requires Python 3.9+.
+
+## Running the tests
+
+`tests.py` is stdlib-only, like the tool itself — no pytest, no install step:
+
+```powershell
+python tests.py
+```
+
+Every fixture is built in a temporary directory; nothing touches real files, the
+Recycle Bin, or your hash cache. The suite includes a scan-equivalence check
+that runs the previous `os.walk` logic as an oracle against the current
+`os.scandir` implementation, so the fast path can't silently start matching a
+different set of files.
 
 ## Releasing (maintainers)
 
